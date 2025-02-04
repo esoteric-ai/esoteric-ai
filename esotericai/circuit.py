@@ -1,4 +1,3 @@
-# circuit.py
 import asyncio
 import json
 import uuid
@@ -9,60 +8,120 @@ import websockets
 
 class _Circuit:
     """
-    Maintains the websocket connection and handles sending tasks (in batches)
-    and receiving completed tasks from the server.
+    Maintains the websocket connection and handles sending tasks and receiving
+    completed tasks.
     """
-    def __init__(self, websocket: websockets.WebSocketClientProtocol, job_name: str):
-        self.websocket = websocket
+    def __init__(self, ws_url: str, job_name: str):
+        self.ws_url = ws_url
         self.job_name = job_name
-
-        # For matching task completions to local futures;
-        # key: task_id (string), value: asyncio.Future
-        self.pending_tasks: Dict[str, asyncio.Future] = {}
-
-        # A queue for tasks to be sent to the server.
+        self.websocket = None
+        self.pending_tasks: Dict[str, (asyncio.Future, dict)] = {}
+        self.pending_acks: Dict[str, asyncio.Future] = {}  # NEW: To track start_job acks.
         self.task_queue: asyncio.Queue = asyncio.Queue()
-
-        # To stop background tasks.
         self._stop = False
+        self.connected_event = asyncio.Event()
+
+    async def run_forever(self):
+        # (Reconnection and sender/receiver logic remains unchanged.)
+        attempt = 0
+        schedule = [5] * 10 + [60] * 10 + [3600] * 24
+        while not self._stop:
+            try:
+                print(f"Attempting connection to {self.ws_url} ...")
+                async with websockets.connect(self.ws_url) as websocket:
+                    self.websocket = websocket
+                    self.connected_event.set()
+                    print("WebSocket connection established.")
+
+                    await self._resend_pending_tasks()
+                    receiver_task = asyncio.create_task(self.background_receiver())
+                    sender_task = asyncio.create_task(self.batch_sender())
+                    await websocket.wait_closed()
+                    receiver_task.cancel()
+                    sender_task.cancel()
+                    await asyncio.gather(receiver_task, sender_task, return_exceptions=True)
+            except Exception as e:
+                print("WebSocket connection error:", e)
+            finally:
+                self.websocket = None
+                self.connected_event.clear()
+            if self._stop:
+                break
+            delay = schedule[attempt] if attempt < len(schedule) else schedule[-1]
+            attempt += 1
+            print(f"Reconnecting in {delay} seconds...")
+            await asyncio.sleep(delay)
+        print("Circuit run_forever stopped.")
+
+    async def start_job(self):
+        """
+        Send a start_job message to the server to force a fresh start and wait for ack.
+        """
+        await self.connected_event.wait()
+        # Create a request_id and a future to wait for an ack.
+        request_id = str(uuid.uuid4())
+        loop = asyncio.get_running_loop()
+        ack_future = loop.create_future()
+        self.pending_acks[request_id] = ack_future
+
+        # Send the start_job message including the request_id.
+        await self.websocket.send(json.dumps({
+            "action": "start_job",
+            "request_id": request_id
+        }))
+        print("[Circuit] Sent start_job message to server, waiting for ack...")
+
+        try:
+            ack = await asyncio.wait_for(ack_future, timeout=30)
+            print("[Circuit] Received start_job ack:", ack)
+            return ack
+        except asyncio.TimeoutError:
+            print("[Circuit] Timeout waiting for start_job ack.")
+            raise
+
+    async def _resend_pending_tasks(self):
+        """Re‑queue tasks that are still waiting for acknowledgment."""
+        for task_id, (future, task_payload) in list(self.pending_tasks.items()):
+            if not future.done():
+                await self.task_queue.put(task_payload)
 
     async def background_receiver(self):
         """
-        Reads messages from the websocket, e.g. "return_tasks" from the server.
-        Each returned task has an 'id'; we match that to a local future.
+        Continuously receive messages. When a 'return_tasks' or 'ack_start_job' message is received,
+        resolve the corresponding pending future.
         """
         try:
             while not self._stop:
                 message = await self.websocket.recv()
-                data = None
-                try:
-                    data = json.loads(message)
-                except json.JSONDecodeError:
-                    print("Received non-JSON message:", message)
-                    continue
-
+                data = json.loads(message)
                 if not data:
                     continue
-
                 action = data.get("action")
                 if action == "return_tasks":
-                    # The server is returning a batch of completed tasks.
                     tasks = data.get("tasks", [])
                     for task in tasks:
                         task_id = task.get("id")
-                        future = self.pending_tasks.pop(task_id, None)
-                        if future and not future.done():
-                            # Set the entire task object as the result.
-                            future.set_result(task)
-                    # Acknowledge the server.
+                        if task_id in self.pending_tasks:
+                            future, _ = self.pending_tasks.pop(task_id)
+                            if not future.done():
+                                future.set_result(task)
+                    # Send the ack back to the server.
                     request_id = data.get("request_id")
                     if request_id:
+                        print("sending ack")
                         ack_payload = {
                             "action": "ack_returned",
                             "request_id": request_id,
                             "ack": True
                         }
                         await self.websocket.send(json.dumps(ack_payload))
+                # NEW: Handle ack for start_job.
+                elif action == "ack_start_job":
+                    request_id = data.get("request_id")
+                    if request_id and request_id in self.pending_acks:
+                        future = self.pending_acks.pop(request_id)
+                        if not future.done():
+                            future.set_result(data.get("ack", False))
                 else:
                     print("Received unhandled message:", data)
         except Exception as exc:
@@ -70,95 +129,78 @@ class _Circuit:
 
     async def batch_sender(self):
         """
-        Periodically gathers tasks from the task_queue and sends them in one "submit_tasks" message.
+        Periodically gather tasks from the task_queue and send them as one batch.
+        If sending fails, re‑queue the tasks.
         """
         try:
             while not self._stop:
                 await asyncio.sleep(0.1)
-
                 batch = []
                 while not self.task_queue.empty():
-                    batch.append(self.task_queue.get_nowait())
-
+                    task_payload = self.task_queue.get_nowait()
+                    batch.append(task_payload)
                 if batch:
-                    payload = {"action": "submit_tasks", "tasks": batch}
+                    if not self.websocket:
+                        # Re‑queue if not connected.
+                        for task_payload in batch:
+                            await self.task_queue.put(task_payload)
+                        continue
                     try:
-                        await self.websocket.send(json.dumps(payload))
+                        await self.websocket.send(json.dumps({
+                            "action": "submit_tasks",
+                            "tasks": batch
+                        }))
                     except Exception as exc:
                         print("Error sending batch:", exc)
+                        for task_payload in batch:
+                            await self.task_queue.put(task_payload)
         except Exception as exc:
             print("batch_sender exception:", exc)
 
     async def send_chat_task(self, models: List[str], conversation: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Creates a new task with a unique 'id'. Instead of a single model,
-        the task has a list of models.
-        Returns a future that completes when the task is processed.
-        """
         task_id = str(uuid.uuid4())
         loop = asyncio.get_running_loop()
         future = loop.create_future()
-        self.pending_tasks[task_id] = future
-
         task_payload = {
             "id": task_id,
-            "models": models,           # <-- New list of models.
+            "models": models,
             "conversation": conversation,
+            "job_name": self.job_name,
         }
-
-        # Enqueue the task for sending.
+        self.pending_tasks[task_id] = (future, task_payload)
         await self.task_queue.put(task_payload)
-
-        # Wait until the task is processed (via worker → server → client).
         completed_task = await future
         return completed_task
 
     async def shutdown(self):
-        """Stop background tasks and close the websocket."""
         self._stop = True
-        await self.websocket.close()
+        if self.websocket:
+            await self.websocket.close()
 
 
 class TaskCircuit:
     """
-    A per-task handle for your user code. It uses the parent _Circuit to submit chat tasks.
+    A per‑task handle for user code.
     """
     def __init__(self, circuit: _Circuit, index: int):
         self._circuit = circuit
         self.index = index
 
     async def chat(self, models: List[str], conversation: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Send a single chat request as a new task. Note that
-        `models` is now a list of strings.
-        Returns the completed task (including its result).
-        """
-        task = await self._circuit.send_chat_task(models, conversation)
-        return task
-
+        return await self._circuit.send_chat_task(models, conversation)
 
 class CircuitForBatchProcessing:
     """
-    Public interface for launching multiple tasks, each of which gets a TaskCircuit handle.
+    Public interface for launching multiple tasks.
     """
-
     @classmethod
     def dispatch(
         cls,
         job_name: str,
         task_func: Callable[[TaskCircuit, int], "asyncio.Future"],
         num_tasks: int,
-        api_url: str  # This is a required parameter.
+        api_url: str  # e.g., "127.0.0.1:8000"
     ) -> None:
-        """
-        Launches multiple tasks under the specified job name.
-        
-        Parameters:
-            job_name (str): The name of the job.
-            task_func (Callable): The async function to run for each task.
-            num_tasks (int): The number of tasks to run.
-            api_url (str): The base URL (host and port) for the API (e.g., "37.194.195.213:6325").
-        """
         asyncio.run(cls._dispatch(job_name, task_func, num_tasks, api_url))
 
     @classmethod
@@ -169,12 +211,9 @@ class CircuitForBatchProcessing:
         num_tasks: int,
         api_url: str
     ):
-        # Construct the required endpoints using the provided api_url.
-        # Here we assume that the API URL provided is in the form "host:port"
+        # Bind the job.
         bind_url = f"http://{api_url}/client/bind"
         ws_url_template = f"ws://{api_url}/client/ws/{{client_uid}}"
-
-        # 1) Bind the job via HTTP.
         async with httpx.AsyncClient() as client:
             resp = await client.post(bind_url, json={"job_name": job_name})
             resp.raise_for_status()
@@ -182,33 +221,23 @@ class CircuitForBatchProcessing:
             client_uid = data["client_uid"]
             print(f"Bound to job '{job_name}' as client {client_uid}")
 
-        # 2) Connect via WebSocket.
         ws_url = ws_url_template.format(client_uid=client_uid)
-        async with websockets.connect(ws_url) as websocket:
-            print("WebSocket connection established.")
+        circuit = _Circuit(ws_url, job_name)
+        circuit_task = asyncio.create_task(circuit.run_forever())
 
-            circuit = _Circuit(websocket, job_name)
+        # Send the start_job message to cancel any prior execution.
+        await circuit.start_job()
 
-            # Start background tasks.
-            receiver_task = asyncio.create_task(circuit.background_receiver())
-            sender_task = asyncio.create_task(circuit.batch_sender())
+        user_tasks = []
+        for i in range(num_tasks):
+            task_circuit = TaskCircuit(circuit, i)
+            user_tasks.append(asyncio.create_task(task_func(task_circuit, i)))
+        try:
+            await asyncio.gather(*user_tasks)
+        except Exception as e:
+            print("Exception in user tasks:", e)
+        finally:
+            await circuit.shutdown()
+            await circuit_task
 
-            user_tasks = []
-            for i in range(num_tasks):
-                task_circuit = TaskCircuit(circuit, i)
-                user_tasks.append(asyncio.create_task(task_func(task_circuit, i)))
-
-            try:
-                await asyncio.gather(*user_tasks)
-            except Exception as e:
-                print("Exception in user tasks:", e)
-            finally:
-                await circuit.shutdown()
-                receiver_task.cancel()
-                sender_task.cancel()
-                try:
-                    await asyncio.gather(receiver_task, sender_task)
-                except asyncio.CancelledError:
-                    pass
-
-            print("All tasks completed. CircuitForBatchProcessing shutdown.")
+        print("All tasks completed. CircuitForBatchProcessing shutdown.")
