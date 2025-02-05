@@ -9,10 +9,10 @@ async def task(circuit, id):
     conv = [
         {
             "role": "user",
-            "content": f"Hello! {id}"
+            "content": f"Hello! You are bot №{5000 + id}."
         }
     ]
-    result = await circuit.chat(["llama8b"], conv)
+    result = await circuit.chat(["Mistral Small 3 (24B)"], conv)
 
     if "error" in result:
         print(f"Task {id} Error:" + str(result['error']))
@@ -24,7 +24,7 @@ start_time = time.time()
 CircuitForBatchProcessing.dispatch(
         job_name="my_chat_job",
         task_func=task,
-        num_tasks=100,
+        num_tasks=500,
         api_url="127.0.0.1:6325"
 )
 
