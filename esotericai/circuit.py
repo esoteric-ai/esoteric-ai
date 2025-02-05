@@ -28,7 +28,7 @@ class _Circuit:
         while not self._stop:
             try:
                 print(f"Attempting connection to {self.ws_url} ...")
-                async with websockets.connect(self.ws_url, max_size=2147483647) as websocket:
+                async with websockets.connect(self.ws_url, max_size=None, ping_timeout=300) as websocket:
                     self.websocket = websocket
                     self.connected_event.set()
                     print("WebSocket connection established.")
